@@ -1,0 +1,305 @@
+
+
+!pip install --quiet numpy==1.24.4
+!pip install --quiet opencv-python mediapipe==0.10.14 simpleaudio requests
+
+# -------------------- Imports --------------------
+import cv2
+import numpy as np
+import mediapipe as mp
+import time
+import csv
+import os
+from collections import deque
+from google.colab import files
+import simpleaudio as sa
+import requests
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders
+
+# -------------------- CONFIGURE ALERT CHANNELS --------------------
+
+EMAIL_ENABLED = False
+EMAIL_SMTP = "smtp.gmail.com"
+EMAIL_PORT = 587
+EMAIL_FROM = "youremail@example.com"    # your email
+EMAIL_PASS = "your_email_app_password"   # app password or smtp password
+EMAIL_TO = ["doctor1@example.com"]       # list of recipient emails
+
+# If you want Telegram alerts, create a bot (BotFather) and set these.
+TELEGRAM_ENABLED = False
+TELEGRAM_BOT_TOKEN = "123456789:ABCDEF..."   # your bot token
+TELEGRAM_CHAT_ID = "987654321"               # recipient chat id (group or user)
+
+# -------------------- Utility: create beep --------------------
+def create_beep(filename="alert.wav", duration=0.25, freq=880):
+    samplerate = 44100
+    t = np.linspace(0, duration, int(samplerate * duration), False)
+    tone = np.sin(freq * t * 2 * np.pi)
+    audio = (tone * 32767).astype(np.int16)
+    import wave
+    with wave.open(filename, 'w') as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(samplerate)
+        wf.writeframes(audio.tobytes())
+    return filename
+
+alert_wav = create_beep()
+
+# -------------------- Helper: send email --------------------
+def send_email(subject, body, attachments=None):
+    if not EMAIL_ENABLED:
+        return False, "email disabled"
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = EMAIL_FROM
+        msg['To'] = ", ".join(EMAIL_TO)
+        msg['Subject'] = subject
+        msg.attach(MIMEText(body, 'plain'))
+        # attachments: list of local file paths
+        if attachments:
+            for path in attachments:
+                part = MIMEBase('application', 'octet-stream')
+                with open(path, 'rb') as f:
+                    part.set_payload(f.read())
+                encoders.encode_base64(part)
+                part.add_header('Content-Disposition', f'attachment; filename="{os.path.basename(path)}"')
+                msg.attach(part)
+        server = smtplib.SMTP(EMAIL_SMTP, EMAIL_PORT)
+        server.starttls()
+        server.login(EMAIL_FROM, EMAIL_PASS)
+        server.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
+        server.quit()
+        return True, "email sent"
+    except Exception as e:
+        return False, f"email error: {e}"
+
+# -------------------- Helper: send telegram --------------------
+def send_telegram(text):
+    if not TELEGRAM_ENABLED:
+        return False, "telegram disabled"
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        resp = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text})
+        return resp.ok, resp.text
+    except Exception as e:
+        return False, f"telegram error: {e}"
+
+# -------------------- Helper: play beep (non-blocking) --------------------
+def play_beep():
+    try:
+        sa.WaveObject.from_wave_file(alert_wav).play()
+    except Exception:
+        pass  # playing may not produce sound in all environments
+
+# -------------------- Upload local video --------------------
+print("📂 Upload your video file (use the upload dialog)...")
+uploaded = files.upload()
+if len(uploaded) == 0:
+    raise SystemExit("No file uploaded. Re-run and upload a video.")
+video_path = list(uploaded.keys())[0]
+print("✅ Uploaded:", video_path)
+
+# -------------------- Output paths --------------------
+OUT_VIDEO = "patient_alerts.mp4"
+OUT_CSV = "alerts.csv"
+SNAPSHOT_DIR = "/content/alerts_snapshots"
+os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+
+# -------------------- MediaPipe setup --------------------
+mp_pose = mp.solutions.pose
+mp_drawing = mp.solutions.drawing_utils
+pose = mp_pose.Pose(min_detection_confidence=0.5, min_tracking_confidence=0.5)
+
+# -------------------- Logging setup --------------------
+csv_file = open(OUT_CSV, mode="w", newline="")
+csv_writer = csv.writer(csv_file)
+csv_writer.writerow(["timestamp", "frame", "alert_type", "details", "snapshot_path"])
+
+def log_alert(frame_idx, alert_type, details=None, snapshot=None):
+    ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    row = [ts, frame_idx, alert_type, details or "", snapshot or ""]
+    csv_writer.writerow(row)
+    csv_file.flush()
+    print(f"[{ts}] ALERT: {alert_type} (frame {frame_idx}) {details or ''}")
+    # play beep
+    play_beep()
+    # try to send notifications
+    msg_text = f"ALERT: {alert_type}\nFrame: {frame_idx}\nDetails: {details or ''}\nTime: {ts}"
+    if EMAIL_ENABLED:
+        ok, r = send_email(f"Patient Alert: {alert_type}", msg_text, attachments=[snapshot] if snapshot else None)
+        print("Email:", ok, r)
+    if TELEGRAM_ENABLED:
+        ok, r = send_telegram(msg_text)
+        print("Telegram:", ok, r)
+
+# -------------------- Heuristics & parameters --------------------
+FALL_ANGLE_THRESHOLD = 50      # smaller angle means more horizontal (tune)
+RESP_WINDOW_SECONDS = 12
+RESPURENT = 30                 # sample frequency fallback (frames per second estimate)
+RESP_LOW_MOVEMENT = 0.5        # tiny movement => possible apnea (tune)
+RESP_HIGH_MOVEMENT = 40.0      # huge motion => erratic (tune)
+DISPLAY_EVERY_N_FRAMES = 30    # show a frame every N (Colab inline)
+
+# -------------------- Video open and output writer --------------------
+cap = cv2.VideoCapture(video_path)
+if not cap.isOpened():
+    raise SystemExit("Error: could not open video: " + video_path)
+fps = cap.get(cv2.CAP_PROP_FPS) or 20.0
+W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+out = cv2.VideoWriter(OUT_VIDEO, fourcc, fps, (W, H))
+
+# Respiration monitor: store recent chest motion or chest normalized Y
+resp_buffer = deque(maxlen=int(RESP_WINDOW_SECONDS * max(1, fps)))
+prev_gray_small = None
+
+frame_idx = 0
+fall_reported = False
+resp_reported = False
+
+print("Processing video... (this may take a while depending on length)")
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+    frame_idx += 1
+    tnow = time.time()
+
+    # mediaPipe pose (RGB required)
+    img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    results = pose.process(img_rgb)
+
+    chest_motion_value = None
+    if results.pose_landmarks:
+        lm = results.pose_landmarks.landmark
+        # shoulders and hips indices
+        try:
+            l_sh = lm[mp_pose.PoseLandmark.LEFT_SHOULDER.value]
+            r_sh = lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value]
+            l_hip = lm[mp_pose.PoseLandmark.LEFT_HIP.value]
+            r_hip = lm[mp_pose.PoseLandmark.RIGHT_HIP.value]
+        except Exception:
+            l_sh = r_sh = l_hip = r_hip = None
+
+        # FALL heuristic: torso orientation using shoulders->hips vector
+        if l_sh and l_hip and r_sh and r_hip:
+            # compute two vectors (shoulder -> hip)
+            sx = ((l_hip.x + r_hip.x)/2.0) - ((l_sh.x + r_sh.x)/2.0)
+            sy = ((l_hip.y + r_hip.y)/2.0) - ((l_sh.y + r_sh.y)/2.0)
+            # angle vs horizontal
+            angle = abs(np.degrees(np.arctan2(sy, sx)))
+            # smaller angle (closer to 0) means torso is lying horizontally
+            if angle < FALL_ANGLE_THRESHOLD and not fall_reported:
+                snap_path = os.path.join(SNAPSHOT_DIR, f"fall_frame{frame_idx}.jpg")
+                cv2.imwrite(snap_path, frame)
+                log_alert(frame_idx, "Patient Fell", f"torso_angle={angle:.1f}", snapshot=snap_path)
+                fall_reported = True
+
+        # Respiration: use averaged shoulder Y as chest signal (normalized)
+        if l_sh and r_sh:
+            chest_y_norm = ((l_sh.y + r_sh.y) / 2.0)  # normalized [0,1]
+            chest_motion_value = chest_y_norm * H
+
+    # fallback chest motion by pixel-diff inside upper torso bbox if pose not stable
+    # compute a small grayscale image for motion detection
+    small = cv2.resize(frame, (320, 240))
+    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+    if prev_gray_small is None:
+        prev_gray_small = gray.copy()
+    # set chest bounding box estimation if pose existed
+    if chest_motion_value is None and results.pose_landmarks:
+        # derive chest box from landmarks (shoulders midpoint ~ chest)
+        # map normalized coordinates to small image coords
+        try:
+            mx = int(((lm[mp_pose.PoseLandmark.LEFT_SHOULDER.value].x + lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].x)/2.0) * 320)
+            my = int(((lm[mp_pose.PoseLandmark.LEFT_SHOULDER.value].y + lm[mp_pose.PoseLandmark.RIGHT_SHOULDER.value].y)/2.0) * 240)
+            bw = int(0.25 * 320)
+            bh = int(0.20 * 240)
+            sx1 = max(0, mx - bw//2); sy1 = max(0, my - bh//2)
+            sx2 = min(319, mx + bw//2); sy2 = min(239, my + bh//2)
+            prev_crop = prev_gray_small[sy1:sy2, sx1:sx2]
+            curr_crop = gray[sy1:sy2, sx1:sx2]
+            if prev_crop.size > 0 and curr_crop.size > 0:
+                diff = cv2.absdiff(prev_crop, curr_crop)
+                chest_motion_value = float(diff.mean())
+        except Exception:
+            chest_motion_value = None
+
+    # Always push some value into buffer for rate estimation
+    if chest_motion_value is not None:
+        resp_buffer.append((tnow, chest_motion_value))
+    else:
+        # if nothing, append small zero-ish value so estimator still has data
+        resp_buffer.append((tnow, 0.0))
+
+    # Estimate respiration rate & variability every few frames
+    if frame_idx % int(max(1, fps//2)) == 0 and len(resp_buffer) > 10:
+        times = np.array([t for t,v in resp_buffer])
+        vals = np.array([v for t,v in resp_buffer])
+        # simple peak detection on detrended signal
+        try:
+            from scipy.signal import find_peaks
+            vals_d = vals - np.mean(vals)
+            peaks, _ = find_peaks(vals_d, distance=int(0.3*fps))
+            if len(peaks) >= 2:
+                peak_times = times[peaks]
+                intervals = np.diff(peak_times)
+                if len(intervals) > 0:
+                    bpm = 60.0 / np.mean(intervals)
+                    var = float(np.std(intervals) / (np.mean(intervals) + 1e-8))
+                    # abnormality conditions
+                    if (bpm < 6 or bpm > 30 or var > 0.6) and not resp_reported:
+                        snap_path = os.path.join(SNAPSHOT_DIR, f"resp_rate_frame{frame_idx}.jpg")
+                        cv2.imwrite(snap_path, frame)
+                        log_alert(frame_idx, "Respiratory Issue (rate)", f"bpm={bpm:.1f}, var={var:.2f}", snapshot=snap_path)
+                        resp_reported = True
+        except Exception:
+            pass
+
+    # Trigger respiratory alert ONLY on huge chest movement
+    if chest_motion_value is not None and not resp_reported:
+        if chest_motion_value > RESP_HIGH_MOVEMENT:  # only huge motion
+            snap_path = os.path.join(SNAPSHOT_DIR, f"resp_motion_frame{frame_idx}.jpg")
+            cv2.imwrite(snap_path, frame)
+            log_alert(frame_idx, "Respiratory Issue (high chest motion)", f"motion={chest_motion_value:.2f}", snapshot=snap_path)
+            resp_reported = True
+
+
+    prev_gray_small = gray.copy()
+
+    # draw pose on frame for output
+    if results.pose_landmarks:
+        mp_drawing.draw_landmarks(frame, results.pose_landmarks, mp_pose.POSE_CONNECTIONS)
+
+    out.write(frame)
+
+    # Show one frame periodically to Colab output (avoid flooding)
+    if frame_idx % DISPLAY_EVERY_N_FRAMES == 0:
+        disp = cv2.resize(frame, (720, int(720 * H / W)))
+        from google.colab.patches import cv2_imshow
+        cv2_imshow(disp)
+
+# cleanup
+cap.release()
+out.release()
+csv_file.close()
+pose.close()
+
+print("Processing complete.")
+print("Alerts log ->", OUT_CSV)
+print("Snapshots ->", SNAPSHOT_DIR)
+print("Output video ->", OUT_VIDEO)
+
+# offer downloads
+try:
+    files.download(OUT_VIDEO)
+    files.download(OUT_CSV)
+except Exception:
+    print("Download the files from the Colab file browser on the left side.")
